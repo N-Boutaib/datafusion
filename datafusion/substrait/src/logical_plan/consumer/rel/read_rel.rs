@@ -18,21 +18,16 @@
 use crate::logical_plan::consumer::SubstraitConsumer;
 use crate::logical_plan::consumer::from_substrait_literal;
 use crate::logical_plan::consumer::from_substrait_named_struct;
-use crate::logical_plan::consumer::utils::ensure_schema_compatibility;
 use datafusion::common::{
     DFSchema, DFSchemaRef, TableReference, not_impl_err, plan_err,
     substrait_datafusion_err, substrait_err,
 };
-use datafusion::datasource::provider_as_source;
-use datafusion::logical_expr::utils::split_conjunction_owned;
-use datafusion::logical_expr::{
-    EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, Values,
-};
+use datafusion::logical_expr::{EmptyRelation, Expr, LogicalPlan, Values};
 use std::sync::Arc;
+use substrait::proto::ReadRel;
 use substrait::proto::expression::MaskExpression;
 use substrait::proto::read_rel::ReadType;
 use substrait::proto::read_rel::local_files::file_or_files::PathType::UriFile;
-use substrait::proto::{Expression, ReadRel};
 use url::Url;
 
 #[expect(deprecated)]
@@ -40,44 +35,6 @@ pub async fn from_read_rel(
     consumer: &impl SubstraitConsumer,
     read: &ReadRel,
 ) -> datafusion::common::Result<LogicalPlan> {
-    async fn read_with_schema(
-        consumer: &impl SubstraitConsumer,
-        table_ref: TableReference,
-        schema: DFSchema,
-        projection: &Option<MaskExpression>,
-        filter: &Option<Box<Expression>>,
-    ) -> datafusion::common::Result<LogicalPlan> {
-        let schema = schema.replace_qualifier(table_ref.clone());
-
-        let filters = if let Some(f) = filter {
-            let filter_expr = consumer.consume_expression(f, &schema).await?;
-            split_conjunction_owned(filter_expr)
-        } else {
-            vec![]
-        };
-
-        let plan = {
-            let provider = match consumer.resolve_table_ref(&table_ref).await? {
-                Some(ref provider) => Arc::clone(provider),
-                _ => return plan_err!("No table named '{table_ref}'"),
-            };
-
-            LogicalPlanBuilder::scan_with_filters(
-                table_ref,
-                provider_as_source(Arc::clone(&provider)),
-                None,
-                filters,
-            )?
-            .build()?
-        };
-
-        ensure_schema_compatibility(plan.schema(), schema.clone())?;
-
-        let schema = apply_masking(schema, projection)?;
-
-        apply_projection(plan, schema)
-    }
-
     let named_struct = read.base_schema.as_ref().ok_or_else(|| {
         substrait_datafusion_err!("No base schema provided for Read Relation")
     })?;
@@ -104,14 +61,14 @@ pub async fn from_read_rel(
                 },
             };
 
-            read_with_schema(
-                consumer,
-                table_reference,
-                substrait_schema,
-                &read.projection,
-                &read.filter,
-            )
-            .await
+            consumer
+                .read_with_schema(
+                    table_reference,
+                    substrait_schema,
+                    &read.projection,
+                    &read.filter,
+                )
+                .await
         }
         Some(ReadType::VirtualTable(vt)) => {
             if vt.values.is_empty() && vt.expressions.is_empty() {
@@ -207,14 +164,14 @@ pub async fn from_read_rel(
             // directly use unwrap here since we could determine it is a valid one
             let table_reference = TableReference::Bare { table: name.into() };
 
-            read_with_schema(
-                consumer,
-                table_reference,
-                substrait_schema,
-                &read.projection,
-                &read.filter,
-            )
-            .await
+            consumer
+                .read_with_schema(
+                    table_reference,
+                    substrait_schema,
+                    &read.projection,
+                    &read.filter,
+                )
+                .await
         }
         _ => {
             not_impl_err!("Unsupported Readtype: {:?}", read.read_type)
@@ -294,7 +251,7 @@ pub fn apply_masking(
 
 /// This function returns a DataFrame with fields adjusted if necessary in the event that the
 /// Substrait schema is a subset of the DataFusion schema.
-fn apply_projection(
+pub fn apply_projection(
     plan: LogicalPlan,
     substrait_schema: DFSchema,
 ) -> datafusion::common::Result<LogicalPlan> {

@@ -15,28 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::utils::ensure_schema_compatibility;
 use super::{
-    from_aggregate_rel, from_cast, from_cross_rel, from_exchange_rel, from_fetch_rel,
-    from_field_reference, from_filter_rel, from_if_then, from_join_rel, from_literal,
-    from_project_rel, from_read_rel, from_scalar_function, from_set_rel,
-    from_singular_or_list, from_sort_rel, from_subquery, from_substrait_rel,
-    from_substrait_rex, from_window_function,
+    apply_masking, apply_projection, from_aggregate_rel, from_cast, from_cross_rel,
+    from_exchange_rel, from_fetch_rel, from_field_reference, from_filter_rel,
+    from_if_then, from_join_rel, from_literal, from_project_rel, from_read_rel,
+    from_scalar_function, from_set_rel, from_singular_or_list, from_sort_rel,
+    from_subquery, from_substrait_rel, from_substrait_rex, from_window_function,
 };
 use crate::extensions::Extensions;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::catalog::TableProvider;
 use datafusion::common::{
-    DFSchema, ScalarValue, TableReference, not_impl_err, substrait_err,
+    DFSchema, ScalarValue, TableReference, not_impl_err, plan_err, substrait_err,
 };
+use datafusion::datasource::provider_as_source;
 use datafusion::execution::{FunctionRegistry, SessionState};
-use datafusion::logical_expr::{Expr, Extension, LogicalPlan};
+use datafusion::logical_expr::utils::split_conjunction_owned;
+use datafusion::logical_expr::{Expr, Extension, LogicalPlan, LogicalPlanBuilder};
 use std::sync::{Arc, RwLock};
 use substrait::proto;
 use substrait::proto::expression as substrait_expression;
 use substrait::proto::expression::{
-    Enum, FieldReference, IfThen, Literal, MultiOrList, Nested, ScalarFunction,
-    SingularOrList, SwitchExpression, WindowFunction,
+    Enum, FieldReference, IfThen, Literal, MaskExpression, MultiOrList, Nested,
+    ScalarFunction, SingularOrList, SwitchExpression, WindowFunction,
 };
 use substrait::proto::{
     AggregateRel, ConsistentPartitionWindowRel, CrossRel, DynamicParameter, ExchangeRel,
@@ -171,6 +174,44 @@ pub trait SubstraitConsumer: Send + Sync + Sized {
     //   See: https://github.com/apache/datafusion/issues/13863
     fn get_extensions(&self) -> &Extensions;
     fn get_function_registry(&self) -> &impl FunctionRegistry;
+
+    async fn read_with_schema(
+        &self,
+        table_ref: TableReference,
+        schema: DFSchema,
+        projection: &Option<MaskExpression>,
+        filter: &Option<Box<Expression>>,
+    ) -> datafusion::common::Result<LogicalPlan> {
+        let schema = schema.replace_qualifier(table_ref.clone());
+
+        let filters = if let Some(f) = filter {
+            let filter_expr = self.consume_expression(f, &schema).await?;
+            split_conjunction_owned(filter_expr)
+        } else {
+            vec![]
+        };
+
+        let plan = {
+            let provider = match self.resolve_table_ref(&table_ref).await? {
+                Some(ref provider) => Arc::clone(provider),
+                _ => return plan_err!("No table named '{table_ref}'"),
+            };
+
+            LogicalPlanBuilder::scan_with_filters(
+                table_ref,
+                provider_as_source(Arc::clone(&provider)),
+                None,
+                filters,
+            )?
+            .build()?
+        };
+
+        ensure_schema_compatibility(plan.schema(), schema.clone())?;
+
+        let schema = apply_masking(schema, projection)?;
+
+        apply_projection(plan, schema)
+    }
 
     // Relation Methods
     // There is one method per Substrait relation to allow for easy overriding of consumer behaviour.
